@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "permissions": [
+    {
+      "id": "system.accessibility",
+      "title": "Accessibility",
+      "summary": "Read app windows and send them clicks and keystrokes",
+      "symbol": "accessibility",
+      "macos": {
+        "status": "ax-trusted",
+        "request": "ax-prompt",
+        "settingsURL": "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility",
+        "relaunchAfterGrant": true
+      }
+    },
+    {
+      "id": "system.screen-recording",
+      "title": "Screen Recording",
+      "summary": "See the contents of windows and the screen",
+      "symbol": "rectangle.dashed.badge.record",
+      "macos": {
+        "status": "screen-capture-preflight",
+        "request": "screen-capture-request",
+        "settingsURL": "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture",
+        "relaunchAfterGrant": true
+      }
+    }
+  ]
+}
