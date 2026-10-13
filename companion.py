@@ -27,10 +27,13 @@ Usage:
     python3 companion.py [--socket <path>]
         [--list|--describe|--provision [name]|--runtime-python]
 
-Plugins are python modules exposing `make_plugin() -> Plugin`, loaded from two
-places: the ones shipped alongside this runtime in `./plugins/`, and any the
-user installed into `~/Library/Application Support/KeepTalkingCompanion/Plugins`
-(`KT_COMPANION_PLUGINS` to override; `--install <path>` copies one in). Their
+Plugins are python modules exposing `make_plugin() -> Plugin`, loaded from
+`~/Library/Application Support/KeepTalkingCompanion/Plugins`
+(`KT_COMPANION_PLUGINS` to override; `--install <path>` copies one in). The
+Companion app installs them there from ports repositories. The runtime ships
+none of its own. A
+plugin is either a single module or a ports-repo folder — `manifest.json` plus
+its entry module, which declares itself with `Plugin.from_manifest`. Their
 top-level imports must be dependency-free (see plugin_host.py).
 """
 
@@ -64,8 +67,9 @@ PLUGIN_HOST = HERE / "plugin_host.py"
 
 
 def user_plugins_dir() -> Path:
-    """Where user-installed plugins live, alongside the ones the Companion
-    ships. Separate directory so an app update never clobbers them."""
+    """Where plugins live — installed from ports repositories by the
+    Companion app, or added by hand. Outside the app bundle, so an app update
+    never clobbers them."""
     override = os.environ.get("KT_COMPANION_PLUGINS")
     path = Path(override) if override else (
         Path.home() / "Library" / "Application Support"
@@ -76,31 +80,70 @@ def user_plugins_dir() -> Path:
 
 
 def plugin_search_paths() -> list[Path]:
-    """Bundled plugins first, then user-installed ones."""
-    return [HERE / "plugins", user_plugins_dir()]
+    """The runtime ships no plugins of its own; they all come from here."""
+    return [user_plugins_dir()]
+
+
+def plugin_modules(directory: Path) -> list[Path]:
+    """The plugin modules in one directory: single-file plugins, and each
+    folder plugin's entry (named by its manifest, `plugin.py` by default)."""
+    modules = []
+    for path in sorted(directory.iterdir()):
+        if path.name.startswith(("_", ".")):
+            continue
+        if path.is_file() and path.suffix == ".py":
+            modules.append(path)
+        elif (path / "manifest.json").is_file():
+            try:
+                entry = json.loads((path / "manifest.json").read_text()).get("entry", "plugin.py")
+            except ValueError as error:
+                print(f"[KT Companion] unreadable manifest in {path.name}: {error}")
+                continue
+            modules.append(path / entry)
+    return modules
+
+
+def load_plugin(module_path: Path) -> Plugin:
+    """Imports a plugin module and builds its plugin. Shared with
+    plugin_host.py, so the companion and the child agree on what loads."""
+    name = f"kt_plugins.{module_path.parent.name}.{module_path.stem}"
+    spec = importlib.util.spec_from_file_location(name, module_path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    plugin = module.make_plugin()
+    plugin.check_manifest()
+    return plugin
+
+
+def port_origin(module_path: Path) -> dict | None:
+    """Where a folder plugin was installed from — the ports repo, slug,
+    version and folder hash the Companion app recorded at install."""
+    try:
+        return json.loads((module_path.parent / ".kt-port.json").read_text())
+    except (OSError, ValueError):
+        return None
 
 
 def discover_plugins(directories: list[Path]) -> list[tuple[Plugin, Path]]:
     """Imports each plugin module *in the companion's interpreter* purely to
-    read its declaration — handlers only ever run in the child process."""
+    read its declaration — handlers only ever run in the child process. The
+    first plugin with a given name wins."""
     found: list[tuple[Plugin, Path]] = []
     seen: set[str] = set()
-    modules = [
-        path
-        for directory in directories if directory.exists()
-        for path in sorted(directory.glob("*.py"))
-    ]
-    for path in modules:
-        if path.name.startswith("_") or path.name in seen:
+    for directory in directories:
+        if not directory.exists():
             continue
-        seen.add(path.name)
-        spec = importlib.util.spec_from_file_location(f"kt_plugins.{path.stem}", path)
-        module = importlib.util.module_from_spec(spec)
-        try:
-            spec.loader.exec_module(module)
-            found.append((module.make_plugin(), path))
-        except Exception as error:
-            print(f"[KT Companion] failed to load plugin {path.name}: {error}")
+        for path in plugin_modules(directory):
+            try:
+                plugin = load_plugin(path)
+            except Exception as error:
+                print(f"[KT Companion] failed to load plugin {path}: {error}")
+                continue
+            if plugin.info["name"] in seen:
+                print(f"[KT Companion] skipping {path}: {plugin.info['name']} is already loaded")
+                continue
+            seen.add(plugin.info["name"])
+            found.append((plugin, path))
     return found
 
 
@@ -240,7 +283,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--install", metavar="PATH",
-        help="copy a plugin module into the user plugins directory",
+        help="copy a plugin module or folder into the user plugins directory",
     )
     parser.add_argument(
         "--provision", nargs="?", const="*", metavar="NAME",
@@ -266,11 +309,14 @@ def main() -> None:
         import shutil
 
         source = Path(args.install).expanduser().resolve()
-        if not source.is_file():
-            print(f"[KT Companion] no such plugin module: {source}")
-            raise SystemExit(1)
         destination = user_plugins_dir() / source.name
-        shutil.copy2(source, destination)
+        if source.is_dir() and (source / "manifest.json").is_file():
+            shutil.copytree(source, destination, dirs_exist_ok=True)
+        elif source.is_file():
+            shutil.copy2(source, destination)
+        else:
+            print(f"[KT Companion] no such plugin module or folder: {source}")
+            raise SystemExit(1)
         print(f"[KT Companion] installed {source.name} → {destination}")
         return
 
@@ -280,10 +326,12 @@ def main() -> None:
         print(json.dumps(
             {
                 "companionVersion": COMPANION_VERSION,
+                "userPluginsDirectory": str(user_plugins_dir()),
                 "plugins": [
                     {
                         **plugin.describe(),
-                        "source": "bundled" if path.parent == HERE / "plugins" else "user",
+                        "source": "repository" if port_origin(path) else "user",
+                        "port": port_origin(path),
                         "modulePath": str(path),
                     }
                     for plugin, path in plugins

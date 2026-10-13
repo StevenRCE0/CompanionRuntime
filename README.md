@@ -27,10 +27,15 @@ Files:
   MCP server.
 - `permissions.json` — the system-permission registry plugins declare from.
 
-Plugins ship in `plugins/` (MarkItDown, BrowserUse, ComputerUse); the user's own
-go in `~/Library/Application Support/KeepTalkingCompanion/Plugins`
+The runtime ships no plugins. They live in
+`~/Library/Application Support/KeepTalkingCompanion/Plugins`
 (`KT_COMPANION_PLUGINS` to override, `companion.py --install <path>` to copy one
-in).
+in), where the Companion app installs them from ports repositories
+([CompanionPorts](https://github.com/StevenRCE0/CompanionPorts); MarkItDown,
+BrowserUse and ComputerUse are on its `builtin` branch). A plugin is a folder
+with `manifest.json` and an entry module that declares itself with
+`Plugin.from_manifest(__file__)`; a single module exposing `make_plugin()`
+still loads too.
 
 ## The protocol, briefly
 

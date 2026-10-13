@@ -991,6 +991,76 @@ class Plugin:
         # the `Connect` stream drains, in order.
         self._channel: Any = None
         self._outbox: asyncio.Queue | None = None
+        # Kinds a manifest declared, by name; None for a plugin declared in
+        # code. See `from_manifest`.
+        self._manifest_kinds: dict[str, dict] | None = None
+
+    @classmethod
+    def from_manifest(cls, path: str | Path, *, attestor: CallAttestor | None = None) -> "Plugin":
+        """A plugin declared by the `manifest.json` beside it — the ports-repo
+        layout. Pass the plugin module's `__file__` (or the manifest's path):
+
+            plugin = Plugin.from_manifest(__file__)
+
+            @plugin.kind("markitdown-convert")
+            async def convert(args, ctx): ...
+
+        Everything descriptive lives in the manifest, so the store and indexes
+        read it without running the module; code only binds handlers to the
+        kinds it declares. `check_manifest()` fails a plugin that leaves one
+        unbound."""
+        path = Path(path)
+        if path.name != "manifest.json":
+            path = path.with_name("manifest.json")
+        manifest = json.loads(path.read_text())
+        plugin = cls(
+            name=manifest["name"],
+            vendor=manifest["vendor"],
+            version=manifest["version"],
+            meters=[
+                (meter["name"], meter["unit"], meter.get("description", ""))
+                for meter in manifest.get("meters", [])
+            ],
+            role=manifest.get("role"),
+            config=[
+                ConfigField(
+                    key=field["key"],
+                    label=field["label"],
+                    type=field.get("type", "string"),
+                    default=field.get("default"),
+                    env=field.get("env"),
+                    choices=field.get("choices"),
+                    description=field.get("description"),
+                )
+                for field in manifest.get("config", [])
+            ],
+            requires=manifest.get("requires"),
+            post_install=manifest.get("postInstall"),
+            summary=manifest.get("summary"),
+            description=manifest.get("description"),
+            symbol=manifest.get("symbol"),
+            tint=manifest.get("tint"),
+            category=manifest.get("category"),
+            homepage=manifest.get("homepage"),
+            permissions=[
+                permission(entry["id"], entry["reason"], required=entry.get("required", True))
+                for entry in manifest.get("permissions", [])
+            ],
+            attestor=attestor,
+        )
+        plugin._manifest_kinds = {kind["name"]: kind for kind in manifest["kinds"]}
+        return plugin
+
+    def check_manifest(self) -> None:
+        """Raises unless every kind the manifest declares has a handler."""
+        if self._manifest_kinds is None:
+            return
+        unbound = sorted(set(self._manifest_kinds) - set(self.kinds))
+        if unbound:
+            raise ValueError(
+                f"{self.info['name']}: manifest.json declares kinds with no handler: "
+                + ", ".join(unbound)
+            )
 
     # -- declaration DSL --
 
@@ -998,7 +1068,7 @@ class Plugin:
         self,
         name: str,
         *,
-        description: str,
+        description: str | None = None,
         display_name: str | None = None,
         input_schema: dict | None = None,
         scope_schema: dict | None = None,
@@ -1009,6 +1079,42 @@ class Plugin:
         sub_tools: list[dict] | None = None,
         resources: list[dict] | None = None,
     ):
+        if self._manifest_kinds is not None:
+            # A manifest plugin binds by name; its manifest is the one place
+            # the kind is described.
+            declared = self._manifest_kinds.get(name)
+            if declared is None:
+                raise ValueError(
+                    f"{self.info['name']}: kind {name!r} isn't declared in manifest.json"
+                )
+            overrides = [
+                key for key, value in {
+                    "description": description, "display_name": display_name,
+                    "input_schema": input_schema, "scope_schema": scope_schema,
+                    "default_scope": default_scope, "objects": objects,
+                    "capabilities": capabilities, "uses_act": uses_act or None,
+                    "sub_tools": sub_tools, "resources": resources,
+                }.items()
+                if value is not None
+            ]
+            if overrides:
+                raise ValueError(
+                    f"{self.info['name']}: kind {name!r} is declared in manifest.json; "
+                    f"don't pass {', '.join(overrides)} in code"
+                )
+            description = declared["description"]
+            display_name = declared.get("displayName")
+            input_schema = declared.get("inputSchema")
+            scope_schema = declared.get("scopeSchema")
+            default_scope = declared.get("defaultScope")
+            objects = declared.get("objects")
+            capabilities = declared.get("capabilities")
+            uses_act = declared.get("usesAct", False)
+            sub_tools = declared.get("subTools")
+            resources = declared.get("resources")
+        elif description is None:
+            raise TypeError(f"kind {name!r} needs a description")
+
         def decorate(handler: Handler) -> Handler:
             self.kinds[name] = _Kind(
                 name=name,

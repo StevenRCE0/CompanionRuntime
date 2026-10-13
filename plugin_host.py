@@ -18,7 +18,6 @@ executes handlers.
 from __future__ import annotations
 
 import argparse
-import importlib.util
 import os
 import stat
 import sys
@@ -27,16 +26,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from keeptalking_plugin import Plugin  # noqa: E402
-
-
-def load_plugin(module_path: Path) -> Plugin:
-    spec = importlib.util.spec_from_file_location(
-        f"kt_plugins.{module_path.stem}", module_path
-    )
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module.make_plugin()
+from companion import load_plugin  # noqa: E402
 
 
 def main() -> None:
