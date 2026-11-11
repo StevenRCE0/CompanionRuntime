@@ -1,8 +1,8 @@
 """KeepTalking plugin SDK.
 
-Speaks the KeepTalking Plugin Protocol to the host over gRPC on its Unix
-socket, with JSON messages (no protobuf). There is no pairing and there are no
-sessions: whoever reaches the socket is the user's own process, and a plugin is
+Speaks the KeepTalking Plugin Protocol over gRPC on the KT Companion's Unix
+socket, with JSON messages (no protobuf). The companion owns the socket and
+relays between plugins and the KeepTalking apps attached to it; a plugin is
 known by the name it gives in ``hello``. Declare *action kinds* with scope
 schemas (the Primitive convention), enforce your instance scope in the handler,
 call ``ctx.report_usage``; the SDK does the rest.
@@ -28,7 +28,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, NamedTuple
 
 PROTOCOL_VERSION = 0
-COMPANION_ROLE = "companion"
+APP_GROUP = "group.org.rcex.KeepTalkingApp"
 
 # Every plugin venv needs the SDK's own dependency, since the plugin process
 # imports this module with the venv's interpreter.
@@ -149,52 +149,17 @@ def _state_dir(name: str) -> Path:
     return path
 
 
-def _discovery_candidates() -> list[Path]:
-    """Places a KeepTalking host may publish `ktpp.json`.
-
-    A sandboxed KeepTalking cannot use plain Application Support — that lives
-    inside its container, invisible to plugin processes — so it publishes into
-    its **app-group** container instead. Unsandboxed hosts (the CLI lab) still
-    use Application Support. Check both, plus the sandbox container directly as
-    a last resort for hosts without a group.
-    """
-    home = Path.home()
-    candidates: list[Path] = [
-        home / "Library" / "Application Support" / "KeepTalking" / "ktpp.json",
-    ]
-    candidates += sorted(
-        (home / "Library" / "Group Containers").glob(
-            "*[Kk]eep[Tt]alking*/ktpp.json"
-        )
-    )
-    candidates += sorted(
-        (home / "Library" / "Containers").glob(
-            "*[Kk]eep[Tt]alking*/Data/Library/Application Support/KeepTalking/ktpp.json"
-        )
-    )
-    return candidates
-
-
-def discover_socket_path() -> str:
+def default_socket_path() -> str:
+    """The companion's socket: one per user, in the app group KeepTalking
+    shares, or ``/tmp`` when that path would overflow the Unix socket limit.
+    Mirrors ``KeepTalkingCompanionLink.socketPath``."""
     override = os.environ.get("KT_PLUGIN_SOCKET")
     if override:
         return override
-    # Freshest first: with several hosts published, follow the one that most
-    # recently announced itself rather than whichever path sorts first.
-    found: list[tuple[float, str]] = []
-    for discovery in _discovery_candidates():
-        try:
-            socket_path = json.loads(discovery.read_text())["socketPath"]
-        except (OSError, json.JSONDecodeError, KeyError):
-            continue
-        if Path(socket_path).exists():
-            found.append((discovery.stat().st_mtime, socket_path))
-    if found:
-        return max(found)[1]
-    raise RuntimeError(
-        "No KeepTalking plugin socket found — start KeepTalking (it publishes "
-        "ktpp.json in its app-group container) or set KT_PLUGIN_SOCKET"
-    )
+    path = str(Path.home() / "Library" / "Group Containers" / APP_GROUP / "ktpp.sock")
+    if len(path.encode()) <= 100:
+        return path
+    return f"/tmp/ktpp-{os.getuid()}.sock"
 
 
 # --- plugin configuration -----------------------------------------------------
@@ -928,6 +893,7 @@ class Plugin:
         tint: str | None = None,
         category: str | None = None,
         homepage: str | None = None,
+        access: dict | None = None,
         permissions: list[dict] | None = None,
         attestor: CallAttestor | None = None,
     ):
@@ -949,6 +915,7 @@ class Plugin:
                 "tint": tint,
                 "category": category,
                 "homepage": homepage,
+                "access": access,
             }.items()
             if value
         }
@@ -1042,6 +1009,7 @@ class Plugin:
             tint=manifest.get("tint"),
             category=manifest.get("category"),
             homepage=manifest.get("homepage"),
+            access=manifest.get("access"),
             permissions=[
                 permission(entry["id"], entry["reason"], required=entry.get("required", True))
                 for entry in manifest.get("permissions", [])
@@ -1177,6 +1145,8 @@ class Plugin:
                         "allowsCustom": allows_custom,
                     }
             decl["scopeSchema"] = schema
+        if access := self.listing.get("access"):
+            decl["access"] = access
         return decl
 
     def kinds_payload(self) -> dict:
@@ -1618,27 +1588,19 @@ class Plugin:
         asyncio.run(self.serve_forever(socket_path))
 
     async def serve_forever(self, socket_path: str | None = None) -> None:
-        """Connects to the host and serves it until a newer copy of this
-        plugin replaces it: waits while the host is away (the gRPC channel
-        reconnects by itself) and reconnects after any drop."""
+        """Connects to the companion and serves it until a newer copy of this
+        plugin replaces it: waits while the companion is away (the gRPC
+        channel reconnects by itself) and reconnects after any drop."""
         import grpc
 
         tag = self.info["name"]
+        path = socket_path or default_socket_path()
         while True:
-            path = socket_path
-            if path is None:
-                try:
-                    path = discover_socket_path()
-                except RuntimeError:
-                    await asyncio.sleep(1.0)  # nothing published yet
-                    continue
             channel = grpc.aio.insecure_channel(
                 f"unix:{path}", options=CHANNEL_OPTIONS
             )
             try:
                 try:
-                    # Waits while the host is away. Gives up now and then only
-                    # to re-read discovery, in case a host appeared elsewhere.
                     await asyncio.wait_for(
                         channel.channel_ready(), timeout=10.0
                     )
@@ -1720,11 +1682,7 @@ class Plugin:
             self.host = message["welcome"]
             self.connected = True
             self._notify(self._connected_waiters)
-            host_node = str((self.host or {}).get("hostNodeID", ""))
-            print(
-                f"[{self.info['name']}] connected {path} (host {host_node[:8]})",
-                flush=True,
-            )
+            print(f"[{self.info['name']}] connected {path}", flush=True)
         elif "call" in message:
             call = message["call"] or {}
             call_id = call.get("requestID", "")

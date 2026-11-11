@@ -5,8 +5,7 @@ supervises.
 Each plugin gets its own venv (so a plugin's dependencies can never break a
 sibling's), which means it also needs its own process: this is that process.
 The companion spawns `<plugin-venv>/bin/python plugin_host.py --module …`,
-and from here on the plugin connects to the KeepTalking socket itself — the
-companion is not in the data path.
+and from here on the plugin connects back to the companion's socket.
 
 Convention this relies on: **a plugin module's top-level imports must be
 dependency-free** (declare kinds and config there; import heavy libraries
@@ -32,14 +31,14 @@ from companion import load_plugin  # noqa: E402
 def main() -> None:
     parser = argparse.ArgumentParser(description="KT plugin host (one plugin)")
     parser.add_argument("--module", required=True, help="path to the plugin module")
-    parser.add_argument("--socket", required=True, help="KeepTalking plugin socket")
+    parser.add_argument("--socket", help="the companion's socket (default: KT_PLUGIN_SOCKET, else the app group)")
     args = parser.parse_args()
 
     plugin = load_plugin(Path(args.module).resolve())
 
     # The companion holds our stdin pipe open and never writes to it; EOF
     # means it died, however it died. Exit with it rather than linger as an
-    # orphan still connected to the host. A thread, so a stalled event loop
+    # orphan still connected to the socket. A thread, so a stalled event loop
     # can't delay it. Terminal/dev runs (no pipe) are unaffected. asyncio
     # before 3.12 hands the child a socketpair rather than a pipe.
     mode = os.fstat(0).st_mode

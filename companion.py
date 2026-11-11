@@ -7,15 +7,15 @@ directory and supervised here. The companion is deliberately a thin shell —
 (browsers, ML runtimes, …) stay here, and the SDK only ever sees KTPP over its
 socket.
 
-Trust model: there is none to set up. The KeepTalking socket is reachable by
-this user alone, so whoever connects is trusted; a plugin is known by its name.
-The companion connects as role="companion" (so KeepTalking can ask it to show
-its window), and each plugin connects on its own, as its own catalog.
+Topology: the companion OWNS the one KTPP socket (companion_server.py) and
+relays between plugins and the KeepTalking apps attached to it. The socket is
+reachable by this user alone, so whoever connects is trusted; a plugin is known
+by its name, an app by the node each of its messages names.
 
 Process model: every plugin runs as a CHILD PROCESS on its own interpreter,
 using its own venv when it declares dependencies (`requires=[…]`). The
-companion provisions those venvs and spawns and restarts the children — it
-never proxies their messages.
+companion provisions those venvs and spawns and restarts the children, which
+connect back to its socket.
 
 The runtime itself needs Python ≥ 3.10 with grpcio (the SDK's one dependency).
 `--runtime-python` sets that up — a venv for the companion, built from the
@@ -24,7 +24,7 @@ Companion app then runs this file with. Everything else here (--list,
 --describe, --provision) runs on any Python 3.9+, standard library only.
 
 Usage:
-    python3 companion.py [--socket <path>]
+    python3 companion.py [--socket <path>]   (default: KT_PLUGIN_SOCKET, else the app group)
         [--list|--describe|--provision [name]|--runtime-python]
 
 Plugins are python modules exposing `make_plugin() -> Plugin`, loaded from
@@ -44,25 +44,17 @@ import asyncio
 import importlib.util
 import json
 import os
+import signal
 import stat
 import sys
-import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
-from keeptalking_plugin import (  # noqa: E402
-    COMPANION_ROLE,
-    Plugin,
-    discover_socket_path,
-)
+from keeptalking_plugin import Plugin, default_socket_path  # noqa: E402
 
 COMPANION_VERSION = "0.1.0"
-# Stdout line the Swift supervisor treats as "surface the panel" — parsed out
-# of the runtime's output rather than logged. Keep in sync with
-# `CompanionSupervisor.revealMarker`.
-REVEAL_MARKER = "@kt-companion reveal"
 PLUGIN_HOST = HERE / "plugin_host.py"
 
 
@@ -187,11 +179,14 @@ async def supervise_plugin(
         backoff = min(backoff * 2, 30.0)
 
 
-async def stdin_commands(companion: Plugin) -> None:
-    """Reads NDJSON commands from stdin (sent by the Companion macOS app)."""
+def stdin_is_pipe() -> bool:
     mode = os.fstat(0).st_mode
-    if not (stat.S_ISFIFO(mode) or stat.S_ISSOCK(mode)):
-        # A terminal or /dev/null (manual runs): no app is sending commands.
+    return stat.S_ISFIFO(mode) or stat.S_ISSOCK(mode)
+
+
+async def stdin_commands(broker) -> None:
+    """NDJSON commands from the Companion macOS app on stdin."""
+    if not stdin_is_pipe():
         return
     loop = asyncio.get_running_loop()
     reader = asyncio.StreamReader()
@@ -200,9 +195,6 @@ async def stdin_commands(companion: Plugin) -> None:
             lambda: asyncio.StreamReaderProtocol(reader), sys.stdin
         )
     except OSError as error:
-        # stdin isn't a pipe (manual/terminal runs). A raise here would take
-        # the WHOLE runtime down through asyncio.gather — commands are an
-        # optional channel, never load-bearing.
         print(f"[KT Companion] stdin commands unavailable ({error}); skipping")
         return
     while True:
@@ -210,7 +202,7 @@ async def stdin_commands(companion: Plugin) -> None:
         if not line:
             # EOF on the app's pipe means the app is gone (quit, crash, or
             # Xcode's SIGKILL). Exiting closes each child's stdin pipe in turn,
-            # so the whole tree follows instead of staying attached to the host.
+            # so the whole tree follows.
             if stat.S_ISFIFO(os.fstat(0).st_mode):
                 os._exit(0)
             break
@@ -219,38 +211,29 @@ async def stdin_commands(companion: Plugin) -> None:
         except json.JSONDecodeError:
             continue
         if cmd.get("cmd") == "openAddAction":
-            try:
-                result = await companion.request_open_add_action(
-                    kind_name=cmd.get("kindName"),
-                    plugin_name=cmd.get("pluginName"))
-                print(f"[KT Companion] openAddAction: {result}")
-            except Exception as e:
-                print(f"[KT Companion] openAddAction failed: {e}")
+            asyncio.ensure_future(broker.open_add_action(
+                cmd.get("kindName"), cmd.get("pluginName"), cmd.get("nodeID")))
+        elif cmd.get("cmd") == "chooseIdentity":
+            broker.choose(cmd.get("token", ""), cmd.get("nodeID"))
 
 
-def companion_plugin() -> Plugin:
-    """The companion's own catalog. It registers no kinds — it supervises
-    plugins; it is not a capability provider — and its venv is the runtime's
-    (see `--runtime-python`)."""
-    return Plugin(
-        name="KT Companion",
-        vendor="keeptalking.dev",
-        version=COMPANION_VERSION,
-        role=COMPANION_ROLE,
-    )
+def runtime_plugin() -> Plugin:
+    """The runtime's own venv (Python >= 3.10 + grpcio), set up by
+    `--runtime-python`; its name keeps the venv where earlier builds put it."""
+    return Plugin(name="KT Companion", vendor="keeptalking.dev", version=COMPANION_VERSION)
 
 
 async def run(socket_path: str, plugins: list[tuple[Plugin, Path]]) -> None:
-    companion = companion_plugin()
-    # The host's reveal request reaches the Swift menu-bar app through a
-    # marked stdout line — the supervisor parses `REVEAL_MARKER` out of the log.
-    companion.on_reveal = lambda: print(REVEAL_MARKER, flush=True)
+    from companion_server import Broker
 
-    tasks = [
-        asyncio.create_task(companion.serve_forever(socket_path)),
-        asyncio.create_task(stdin_commands(companion)),
-    ]
+    broker = Broker(has_ui=stdin_is_pipe())
+    await broker.start(socket_path)
+    stop = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    for signum in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(signum, stop.set)
 
+    tasks = [asyncio.ensure_future(stdin_commands(broker))]
     for plugin, module_path in plugins:
         # A venv whose requirement set changed (an SDK or plugin update)
         # re-provisions on its own: the user installed this plugin already,
@@ -264,9 +247,12 @@ async def run(socket_path: str, plugins: list[tuple[Plugin, Path]]) -> None:
                 f"— run `companion.py --provision {plugin.info['name']}` "
                 f"(falling back to the runtime interpreter)"
             )
-        tasks.append(asyncio.create_task(supervise_plugin(plugin, module_path, socket_path)))
+        tasks.append(asyncio.ensure_future(supervise_plugin(plugin, module_path, socket_path)))
 
-    await asyncio.gather(*tasks)
+    await stop.wait()
+    await broker.shutdown()
+    for task in tasks:
+        task.cancel()
 
 
 def main() -> None:
@@ -297,7 +283,7 @@ def main() -> None:
 
     if args.runtime_python:
         # Progress goes to stderr; stdout carries only the interpreter path.
-        companion = companion_plugin()
+        companion = runtime_plugin()
         if not companion.is_provisioned and not companion.provision(
             log=lambda line: print(line, file=sys.stderr, flush=True)
         ):
@@ -363,23 +349,7 @@ def main() -> None:
     if args.list:
         return
 
-    socket_path = args.socket
-    if not socket_path:
-        for attempt in range(120):
-            try:
-                socket_path = discover_socket_path()
-                break
-            except RuntimeError:
-                if attempt == 0:
-                    print("[KT Companion] waiting for KeepTalking to publish a socket…")
-                time.sleep(1.0)
-        else:
-            print("[KT Companion] timed out waiting for socket after 2 minutes")
-            raise SystemExit(1)
-    try:
-        asyncio.run(run(socket_path, plugins))
-    except KeyboardInterrupt:
-        print("\n[KT Companion] shutting down")
+    asyncio.run(run(args.socket or default_socket_path(), plugins))
 
 
 if __name__ == "__main__":

@@ -5,22 +5,28 @@ The **companion runtime** for KeepTalking's plugin action catalogs (see
 installs, hosting N plugins. Heavy dependencies (browsers, ML runtimes) live
 here, never in the KTSDK; the socket is the boundary.
 
-KTPP is gRPC over KeepTalking's Unix socket, with JSON messages (no
-protobuf). There is **no pairing and there are no sessions**: the socket is
-reachable by this user alone, so whoever connects is trusted, and a plugin is
-known by the name it gives in `hello`. Each plugin connects on its own, as its
-own catalog; the companion connects too (as `role: companion`, so KeepTalking
-can ask it to show its window) and supervises the plugins' processes. It never
-proxies their messages.
+KTPP is gRPC over one Unix socket, with JSON messages (no protobuf). **The
+companion owns the socket**: plugins connect to it, KeepTalking apps attach to
+it, and the companion relays between them. The socket is reachable by this user
+alone, so whoever connects is trusted. A plugin is known by the name it gives in
+`hello`; an app names the node (identity) every message speaks for, so one app
+can carry several identities and several apps can attach at once.
+
+The socket is `~/Library/Group Containers/group.org.rcex.KeepTalkingApp/ktpp.sock`
+(`/tmp/ktpp-<uid>.sock` when that path would pass 100 bytes; `KT_PLUGIN_SOCKET`
+or `--socket` to override). There is no discovery file.
 
 Files:
 
 - `companion.py` — the runtime shell: plugin discovery, venv provisioning,
-  supervision, and the runtime's own interpreter (`--runtime-python`).
+  supervision, the broker, and the runtime's own interpreter
+  (`--runtime-python`).
+- `companion_server.py` — the broker: serves both services on the socket and
+  routes between plugins and apps (also runs alone: `--socket <path>`).
 - `plugin_host.py` — runs one plugin in its own interpreter (the child process
   the companion supervises).
 - `keeptalking_plugin.py` — the plugin SDK: the kind DSL, resources, scope
-  options, `ctx.act` / `ctx.elucidate`, and the KTPP client. Its one
+  options, `ctx.act` / `ctx.elucidate`, and the plugin's KTPP client. Its one
   dependency is `grpcio`, imported only when a plugin connects — reading a
   plugin's declaration needs the standard library alone.
 - `keeptalking_mcp.py` — a stdlib MCP stdio client for plugins that wrap an
@@ -39,23 +45,58 @@ still loads too.
 
 ## The protocol, briefly
 
-Service `keeptalking.plugin.PluginHost` (mirrors
-`KeepTalking/Sources/KeepTalking/Services/PluginHost/Wire/`):
+Both services mirror `KeepTalking/Sources/KeepTalking/Services/PluginHost/Wire/`.
+Messages are flat JSON objects with one body key: `{"id": 3, "call": {…}}`,
+`{"replyTo": 3, "callResult": {…}}`.
+
+Service `keeptalking.plugin.PluginHost` — what plugins speak:
 
 - `Connect` (bidirectional stream) — the plugin's connection. The plugin sends
-  `hello` (name, role, version, a per-launch `instance`) and its `kinds`;
-  KeepTalking answers `welcome` and sends its calls, scope-option and
-  resource-read requests, and reveal requests down the same stream. Messages
-  are flat JSON objects with one body key: `{"id": 3, "call": {…}}`,
-  `{"replyTo": 3, "callResult": {…}}`. A newer connection with the same plugin
-  name replaces an older one (`goodbye: superseded`), and the stream ending
-  means the plugin is gone.
-- `RequestAct` — one AI turn for an in-flight call (bound by its `requestID`).
+  `hello` (name, version, a per-launch `instance`) and its `kinds`; the
+  companion answers `welcome` and relays calls, scope-option and resource-read
+  requests down the same stream. A newer connection with the same plugin name
+  replaces an older one (`goodbye: superseded`); the stream ending means the
+  plugin is gone.
+- `RequestAct` — one AI turn for an in-flight call, routed by its `requestID`
+  to the app that made the call.
 - `ProposeAction` — ask the user to create an instance of one of the plugin's
   own kinds.
 - `OpenAddAction` — open KeepTalking's Add Action flow.
 
-Calls can be made verifiable without a protocol change: the host's
+Service `keeptalking.plugin.Companion` — what KeepTalking apps speak. One
+`Attach` stream carries everything, so a call's elucidations stay ahead of its
+result. App messages carry `from` (the node); companion messages carry `to`.
+
+- The app sends `hello`, then `keepalive` every 5 s per identity. An identity
+  is online until 15 s after its last keepalive; `leave` takes it offline at
+  once, and so does the attachment ending.
+- The companion answers `welcome`, then a `catalog` of every plugin (name,
+  version, `connected`, kinds), and again on every change.
+- App requests: `call`, `scopeOptions`, `resourceRead` (each
+  `{plugin, request}`), `cancel`, `reveal`.
+- Companion requests to an identity: `act`, `actionCreate`, `addAction`.
+- Failures are `{code, message, ktppCode}` (`ktppCode: not_connected` when the
+  plugin is away).
+
+When a plugin's `ProposeAction` / `OpenAddAction` has more than one identity
+it could go to, the companion asks the user (see the markers below).
+
+## Talking to the Companion app
+
+The Swift app reads marked stdout lines and writes NDJSON to stdin:
+
+- `@kt-companion reveal` — show the window.
+- `@kt-companion identities {"identities": [{"id", "label"}]}` — the online
+  identities, on start and on every change.
+- `@kt-companion choose-identity {"token", "plugin", "kind", "reason",
+  "identities"}` — pick one; answer with
+  `{"cmd": "chooseIdentity", "token": …, "nodeID": … | null}` (null declines;
+  unanswered after 120 s declines). `@kt-companion choice-closed {"token"}`
+  follows either way.
+- `{"cmd": "openAddAction", "kindName", "pluginName", "nodeID"}` — open Add
+  Action in that identity (without `nodeID`: the only one online, else ask).
+
+Calls can be made verifiable without a protocol change: KeepTalking's
 `KeepTalkingCallAttestor` may attach `authorization` evidence to a call, and a
 plugin's `CallAttestor` (`Plugin(attestor=…)`) may check it and return a
 `receipt`. Neither attests anything by default.
@@ -70,24 +111,16 @@ the system one, then launches `companion.py` on the interpreter it printed.
 Plugins with dependencies get their own venvs (`--provision`), each with grpcio
 as well; a venv whose requirement set changed updates itself on the next start.
 
-## Run it against the lab host
-
-Terminal 1 — the lab host (the SDK's `KeepTalkingPluginHost`):
-
-```bash
-swift run --package-path ../../../KeepTalking KeepTalking pluginlab --socket /tmp/ktpp-demo.sock --stay
-```
-
-Terminal 2 — the companion:
+## Run it by hand
 
 ```bash
 PY=$(python3 companion.py --runtime-python)
-KT_PLUGIN_SOCKET=/tmp/ktpp-demo.sock "$PY" companion.py
+"$PY" companion.py --socket /tmp/ktpp-demo.sock
 ```
 
-The companion and each plugin connect and are welcomed; the lab prints the
-kinds each one pushes. Add `--call <kind> --args '<json>' --scope '<json>'` to
-the lab to drive one call end to end.
+Then attach KeepTalking or the SDK's lab
+(`swift run --package-path ../../../KeepTalking KeepTalking pluginlab --socket /tmp/ktpp-demo.sock`)
+to the same socket.
 
 ## State
 
